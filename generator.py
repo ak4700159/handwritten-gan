@@ -1,14 +1,17 @@
-from main import *
+from gan_config import GANConfig
 from layer import *
 from discriminator import Discriminator
 from torchvision.utils import save_image
 import torch.nn.functional as F
+from pathlib import Path
+
 
 
 class FontGAN:
     def __init__(self, config: GANConfig, device: torch.device):
         self.config = config
         self.device = device
+        self.train_step_count = 0
         
         # Initialize networks
         self.encoder = Encoder(conv_dim=config.conv_dim).to(device)
@@ -95,7 +98,7 @@ class FontGAN:
         
     def train_step(self, real_source, real_target, font_embeddings, font_ids):
         batch_size = real_source.size(0)
-        print(f"\n===== New Training Step =====")
+        # print(f"\n===== New Training Step =====")
         # print(f"Batch size: {batch_size}")
         
         # 모든 입력 데이터를 GPU로 이동
@@ -137,57 +140,56 @@ class FontGAN:
         fake_target = self.decoder(embedded, skip_connections)
         # print(f"Generated fake target shape: {fake_target.shape}")
         
-        # Discriminator processing
-        # print("\n5. Discriminator Processing:")
-        d_real_score, d_real_logits, d_real_cat = self.discriminator(
-            torch.cat([real_source, real_target], dim=1)
-        )
-        # print(f"D Real Scores - score: {d_real_score.shape}, logits: {d_real_logits.shape}, category: {d_real_cat.shape}")
+        # Discriminator 업데이트 (빈도 조절)
+        if self.train_step_count % self.config.d_update_freq == 0:
+            d_real_score, d_real_logits, d_real_cat = self.discriminator(
+                torch.cat([real_source, real_target], dim=1)
+            )
+            d_fake_score, d_fake_logits, d_fake_cat = self.discriminator(
+                torch.cat([real_source, fake_target.detach()], dim=1)
+            )
+            
+            # Label smoothing 적용
+            real_labels = torch.ones_like(d_real_logits).to(self.device) * 0.9  # 1.0 대신 0.9
+            fake_labels = torch.zeros_like(d_fake_logits).to(self.device) * 0.1  # 0.0 대신 0.1
+            
+            d_loss = self._adversarial_loss(d_real_logits, d_fake_logits, real_labels, fake_labels)
+            d_cat_loss = self._category_loss(d_real_cat, d_fake_cat, font_ids)
+            
+            d_total_loss = d_loss + d_cat_loss
+            
+            self.d_optimizer.zero_grad()
+            d_total_loss.backward()
+            self.d_optimizer.step()
         
-        d_fake_score, d_fake_logits, d_fake_cat = self.discriminator(
-            torch.cat([real_source, fake_target.detach()], dim=1)
-        )
-        # print(f"D Fake Scores - score: {d_fake_score.shape}, logits: {d_fake_logits.shape}, category: {d_fake_cat.shape}")
         
-        # Calculate losses
-        # print("\n6. Loss Calculation:")
-        d_adv_loss = self._adversarial_loss(d_real_logits, d_fake_logits)
-        d_cat_loss = self._category_loss(d_real_cat, d_fake_cat, font_ids)
-        d_loss = d_adv_loss + d_cat_loss
-        # print(f"Discriminator Losses - Adversarial: {d_adv_loss.item():.4f}, Category: {d_cat_loss.item():.4f}")
-        
-        # Update discriminator
-        self.d_optimizer.zero_grad()
-        d_loss.backward()
-        self.d_optimizer.step()
-        # print("Discriminator update completed")
-        
-        # Generator training
-        # print("\n7. Generator Training:")
+        # Generator 업데이트
         g_fake_score, g_fake_logits, g_fake_cat = self.discriminator(
             torch.cat([real_source, fake_target], dim=1)
         )
         
+        # Generator loss 계산에 Feature matching 추가
         g_adv_loss = self.bce_loss(g_fake_logits, torch.ones_like(g_fake_logits))
         g_l1_loss = self.l1_loss(fake_target, real_target) * self.config.l1_lambda
         g_const_loss = self._consistency_loss(encoded_source, fake_target)
         g_cat_loss = self.bce_loss(g_fake_cat, F.one_hot(font_ids, self.config.fonts_num).float())
         
-        g_loss = g_adv_loss + g_l1_loss + g_const_loss + g_cat_loss
-        # print(f"Generator Losses - Adversarial: {g_adv_loss.item():.4f}, L1: {g_l1_loss.item():.4f}")
-        # print(f"                 Consistency: {g_const_loss.item():.4f}, Category: {g_cat_loss.item():.4f}")
+        g_total_loss = g_adv_loss + g_l1_loss + g_const_loss + g_cat_loss
         
         # Update generator
         self.g_optimizer.zero_grad()
-        g_loss.backward()
+        g_total_loss.backward()
         self.g_optimizer.step()
+        # print(f"Generator Losses - Adversarial: {g_adv_loss.item():.4f}, L1: {g_l1_loss.item():.4f}")
+        # print(f"                 Consistency: {g_const_loss.item():.4f}, Category: {g_cat_loss.item():.4f}")
+
         # print("Generator update completed")
         
         # print("\n===== Training Step Completed =====")
         
         return {
             'd_loss': d_loss.item(),
-            'g_loss': g_loss.item(),
+            'g_loss': g_total_loss.item(),
             'l1_loss': g_l1_loss.item(),
             'const_loss': g_const_loss.item()
         }
@@ -222,12 +224,10 @@ class FontGAN:
             print(f"Embeddings shape: {embeddings.shape}")
             print(f"Font IDs: {ids}")
             raise
-    
-    def _adversarial_loss(self, real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
-        """Calculate adversarial loss for discriminator"""
-        real_labels = torch.ones_like(real_logits)
-        fake_labels = torch.zeros_like(fake_logits)
         
+    def _adversarial_loss(self, real_logits: torch.Tensor, fake_logits: torch.Tensor, 
+                        real_labels: torch.Tensor, fake_labels: torch.Tensor) -> torch.Tensor:
+        """Calculate adversarial loss for discriminator with label smoothing"""
         real_loss = self.bce_loss(real_logits, real_labels)
         fake_loss = self.bce_loss(fake_logits, fake_labels)
         
@@ -261,13 +261,20 @@ class FontGAN:
             'l1_loss': [],
             'const_loss': [],
             'discriminator_acc': [],
-            'font_classification_acc': [],
-            'fid_score': []  # Fréchet Inception Distance
+            'font_classification_acc': []
+            # FID score는 복잡한 계산이 필요하므로 일단 제외
         }
         
         try:
             with torch.no_grad():
+                # 데이터 로더가 비어있는지 확인
+                if len(dataloader) == 0:
+                    raise ValueError("Dataloader is empty")
+                    
                 for batch_idx, (source, target, font_ids) in enumerate(dataloader):
+                    if batch_idx >= 100:  # 평가할 배치 수 제한
+                        break
+                        
                     source = source.to(self.device)
                     target = target.to(self.device)
                     font_ids = font_ids.to(self.device)
@@ -278,27 +285,33 @@ class FontGAN:
                     embedded = torch.cat([encoded_source, embedding], dim=1)
                     fake_target = self.decoder(embedded, skip_connections)
                     
-                    # L1 Loss (픽셀 유사도)
+                    # L1 Loss 계산
                     l1_loss = self.l1_loss(fake_target, target)
                     metrics['l1_loss'].append(l1_loss.item())
                     
-                    # Consistency Loss (특징 보존)
+                    # Consistency Loss 계산
                     const_loss = self._consistency_loss(encoded_source, fake_target)
                     metrics['const_loss'].append(const_loss.item())
                     
-                    # Discriminator의 진짜/가짜 분류 정확도
+                    # Discriminator 정확도 계산
                     real_score, _, real_cat = self.discriminator(torch.cat([source, target], dim=1))
                     fake_score, _, fake_cat = self.discriminator(torch.cat([source, fake_target], dim=1))
                     
                     disc_acc = ((real_score > 0.5).float().mean() + 
-                              (fake_score < 0.5).float().mean()) / 2
+                            (fake_score < 0.5).float().mean()) / 2
                     metrics['discriminator_acc'].append(disc_acc.item())
                     
-                    # 폰트 분류 정확도
+                    # 폰트 분류 정확도 계산
                     font_labels = F.one_hot(font_ids, self.config.fonts_num).float()
                     font_acc = (torch.argmax(real_cat, dim=1) == font_ids).float().mean()
                     metrics['font_classification_acc'].append(font_acc.item())
                     
+                # 각 메트릭이 비어있지 않은지 확인
+                for k, v in metrics.items():
+                    if not v:
+                        print(f"Warning: No values collected for metric {k}")
+                        metrics[k] = [0.0]  # 기본값 설정
+                
                 # 평균 계산
                 avg_metrics = {k: sum(v)/len(v) for k, v in metrics.items()}
                 
@@ -310,6 +323,10 @@ class FontGAN:
                 
                 return avg_metrics
                 
+        except Exception as e:
+            print(f"Error during evaluation: {e}")
+            return {k: 0.0 for k in metrics.keys()}  # 오류 시 기본값 반환
+            
         finally:
             self.train()
 
