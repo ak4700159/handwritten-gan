@@ -17,7 +17,7 @@ class FontGAN:
         self.encoder = Encoder(conv_dim=config.conv_dim).to(device)
         # embedded_dim을 encoded_source의 채널 수 + embedding_dim으로 설정
         self.decoder = Decoder(
-            embedded_dim=512 + config.embedding_dim,  # 512는 encoder의 마지막 conv layer의 출력 채널 수
+            embedded_dim=1152,  # 인코더 출력(512) + 임베딩(512)
             conv_dim=config.conv_dim
         ).to(device)
         self.discriminator = Discriminator(category_num=config.fonts_num).to(device)
@@ -97,7 +97,7 @@ class FontGAN:
         self.train()  # 학습 모드로 복귀
         
     def train_step(self, real_source, real_target, font_embeddings, font_ids):
-        batch_size = real_source.size(0)
+        # batch_size = real_source.size(0)
         # print(f"\n===== New Training Step =====")
         # print(f"Batch size: {batch_size}")
         
@@ -195,27 +195,20 @@ class FontGAN:
         }
     
     def _get_embeddings(self, embeddings: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-        """Get font embeddings for given IDs and resize to match encoded source size"""
+        """Get font embeddings for given IDs"""
         try:
-            # font_ids가 1부터 시작하는 경우를 처리
-            adjusted_ids = ids - 1  # 인덱스를 0부터 시작하도록 조정
+            # font_ids를 0-based 인덱스로 변환
+            adjusted_ids = ids - 1
             
             # 유효한 인덱스 범위 체크
             if torch.any(adjusted_ids < 0) or torch.any(adjusted_ids >= embeddings.size(0)):
                 raise ValueError(f"Font IDs out of range. Expected 1 to {embeddings.size(0)}, got min={ids.min()}, max={ids.max()}")
             
-            # 임베딩 선택
-            selected = embeddings[adjusted_ids]  # Shape: [batch_size, 1, 1, embedding_dim]
-            batch_size = selected.size(0)
-            embedding_dim = selected.size(-1)
+            # 임베딩을 선택 (이미 3x3 구조)
+            selected = embeddings[adjusted_ids]  # Shape: [batch_size, embedding_dim, 3, 3]
             
-            # Reshape to [batch_size, embedding_dim, 2, 2]
-            selected = selected.view(batch_size, embedding_dim, 1, 1)
-            selected = selected.expand(-1, -1, 2, 2)
-            
-            # print(f"Embeddings shape: {embeddings.shape}")
-            # print(f"Font IDs range: {ids.min().item()} to {ids.max().item()}")
-            # print(f"Reshaped embedding shape: {selected.shape}")
+            # 디버깅을 위한 shape 출력
+            # print(f"Selected embedding shape: {selected.shape}")
             
             return selected
             
@@ -224,7 +217,7 @@ class FontGAN:
             print(f"Embeddings shape: {embeddings.shape}")
             print(f"Font IDs: {ids}")
             raise
-        
+            
     def _adversarial_loss(self, real_logits: torch.Tensor, fake_logits: torch.Tensor, 
                         real_labels: torch.Tensor, fake_labels: torch.Tensor) -> torch.Tensor:
         """Calculate adversarial loss for discriminator with label smoothing"""
@@ -331,30 +324,39 @@ class FontGAN:
             self.train()
 
     def generate_evaluation_samples(self, dataloader, font_embeddings, save_dir: Path):
-        """평가용 샘플 생성"""
         self.eval()
         save_dir.mkdir(parents=True, exist_ok=True)
         
+        # 전체 데이터셋에서 서로 다른 폰트를 가진 샘플 수집
+        unique_samples = {}
+        
         with torch.no_grad():
-            for batch_idx, (source, target, font_ids) in enumerate(dataloader):
-                if batch_idx >= 10:  # 10개의 배치만 생성
+            for source, target, font_ids in dataloader:
+                for i, font_id in enumerate(font_ids):
+                    font_id = font_id.item()
+                    if font_id not in unique_samples and len(unique_samples) < 10:
+                        unique_samples[font_id] = (source[i:i+1], target[i:i+1])
+                    if len(unique_samples) == 10:
+                        break
+                if len(unique_samples) == 10:
                     break
-                    
+            
+            # 수집된 샘플로 이미지 생성
+            for idx, (font_id, (source, target)) in enumerate(unique_samples.items()):
                 source = source.to(self.device)
                 target = target.to(self.device)
-                font_ids = font_ids.to(self.device)
+                font_id = torch.tensor([font_id], device=self.device)
                 
-                # 가짜 이미지 생성
                 encoded_source, skip_connections = self.encoder(source)
-                embedding = self._get_embeddings(font_embeddings, font_ids)
+                embedding = self._get_embeddings(font_embeddings, font_id)
                 embedded = torch.cat([encoded_source, embedding], dim=1)
                 fake_target = self.decoder(embedded, skip_connections)
                 
-                # 이미지 저장
                 self.save_samples(
-                    save_dir / f'eval_sample_{batch_idx}.png',
+                    save_dir / f'eval_sample_font_{font_id.item()}.png',
                     source,
                     target,
-                    font_ids,
+                    fake_target,
+                    font_id,
                     font_embeddings
                 )

@@ -9,23 +9,45 @@ def generate_font_embeddings(
     save_dir: str = "./fixed_dir",
     stddev: float = 0.01
 ):
-    """Generate and save font style embeddings"""
-    # fonts_num + 1 크기로 생성 (0번 인덱스는 패딩용)
+    """폰트 스타일 임베딩을 생성하고 저장하는 함수입니다.
+    
+    이 함수는 각 폰트에 대해 3x3 공간 구조를 가진 임베딩을 생성합니다.
+    이는 한글 글자의 구조적 특성(초성/중성/종성)을 더 잘 표현할 수 있게 해줍니다.
+    
+    Args:
+        fonts_num (int): 생성할 폰트 임베딩의 수
+        embedding_dim (int): 각 임베딩의 차원 수
+        save_dir (str): 임베딩을 저장할 디렉토리 경로
+        stddev (float): 초기 랜덤 값의 표준편차
+    
+    Returns:
+        torch.Tensor: 생성된 폰트 임베딩 텐서
+    """
+    # 먼저 1x1 크기로 임베딩을 생성합니다
     embeddings = torch.randn(fonts_num, 1, 1, embedding_dim) * stddev
     
-    # L2 normalize embeddings
+    # L2 정규화를 수행하여 임베딩 벡터의 크기를 일정하게 만듭니다
     embeddings = F.normalize(embeddings.view(fonts_num, -1), p=2, dim=1)
-    embeddings = embeddings.view(fonts_num, 1, 1, embedding_dim)
     
-    # 저장
+    # 3x3 구조로 확장합니다
+    embeddings = embeddings.view(fonts_num, embedding_dim, 1, 1)
+    embeddings = F.interpolate(
+        embeddings, 
+        size=(3, 3), 
+        mode='bilinear',
+        align_corners=True
+    )
+    
+    # 저장 경로를 설정하고 디렉토리를 생성합니다
     save_path = Path(save_dir) / 'EMBEDDINGS.pkl'
     save_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # 안전하게 저장
-    torch.save(embeddings, save_path, weights_only=True)
+    # 임베딩을 안전하게 저장합니다
+    torch.save(embeddings, save_path)
     
     print(f"Font style embeddings generated and saved to {save_path}")
     print(f"Shape: {embeddings.shape}")
+    print(f"Each embedding represents a font style in a 3x3 spatial structure")
     
     return embeddings
 
@@ -49,39 +71,3 @@ def load_embeddings(embedding_path: str, device: torch.device):
         
     except Exception as e:
         raise Exception(f"Error loading font embeddings: {e}")
-
-#     # stddev = 표준 편차
-#     # 임베딩 파일이 없으면 초기값 넣어 생성한다?
-# def init_embedding(embedding_num, embedding_dim, stddev=0.01):
-#     # 정규분포를 생성하는 난수 함수, 정규분포에서 무작위 난수를 생성하여 텐서를 반환
-#     # embedding_num * embedding_dim 차원의 텐서가 생성
-#     embedding = torch.randn(embedding_num, embedding_dim) * stddev
-    
-#     embedding = embedding.reshape((embedding_num, 1, 1, embedding_dim))
-#     return embedding
-
-# def generate_font_embeddings(fonts_num, embedding_dim=128, save_dir="./", stddev=0.01):
-#     """
-#     fonts_num: 학습할 폰트 스타일의 수
-#     embedding_dim: 임베딩 벡터의 차원
-#     save_dir: 임베딩 파일을 저장할 경로
-#     stddev: 정규분포의 표준편차
-#     """
-#     # 초기 임베딩 생성 (fonts_num x 1 x 1 x embedding_dim)
-#     embeddings = init_embedding(fonts_num, embedding_dim, stddev=stddev)
-    
-#     # L2 정규화 적용 - 각 폰트 스타일의 임베딩 벡터를 단위 벡터로 정규화
-#     embeddings_flat = embeddings.view(fonts_num, -1)
-#     embeddings_normalized = F.normalize(embeddings_flat, p=2, dim=1)
-#     embeddings = embeddings_normalized.view(fonts_num, 1, 1, embedding_dim)
-    
-#     # 저장
-#     if not os.path.exists(save_dir):
-#         os.mkdir(save_dir)
-#     save_path = os.path.join(save_dir, 'EMBEDDINGS.pkl')
-#     torch.save(embeddings, save_path)
-    
-#     print(f"Font style embeddings generated and saved to {save_path}")
-#     print(f"Shape: {embeddings.shape}")
-    
-#     return embeddings

@@ -7,3 +7,5 @@
 *.ipynb
 *.pth
 __pycache__/
+results*/
+message.py

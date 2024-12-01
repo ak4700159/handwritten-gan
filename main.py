@@ -13,7 +13,7 @@ from gan_config import GANConfig
 import pandas as pd
 import csv
 from datetime import datetime  # datetime.datetime 대신 datetime만 import
-
+from message import GANTrainingCallback, DiscordLogger
 
 def resume_training(checkpoint_path: str, config: GANConfig, data_dir: str, save_dir: str, device: torch.device):
     """이전 체크포인트에서 학습 재개"""
@@ -110,7 +110,7 @@ def save_checkpoint(model: FontGAN, epoch: int, losses: dict, save_path: Path):
         print(f"Failed to save checkpoint: {e}")
 
 def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torch.device, 
-                  start_epoch: int = 0, initial_model: Optional[FontGAN] = None):
+                  start_epoch: int = 0, initial_model: Optional[FontGAN] = None, callback: GANTrainingCallback = None):
     print("\n=== Starting Font GAN Training ===")
     print(f"Device: {device}")
     print(f"Data directory: {data_dir}")
@@ -157,8 +157,11 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
     # GAN 모델 초기화 또는 기존 모델 사용
     gan = initial_model if initial_model is not None else FontGAN(config, device)
     
-    # 나머지 학습 코드는 동일하지만 epoch 범위 수정
+    # 조기 종료를 위한 파라미터 설정
+    early_stopping_patience = 15  # 15 에폭 동안 개선이 없으면 종료
+    min_loss_improvement = 0.001  # 최소 손실 개선 기준값
     best_loss = float('inf')
+    patience_counter = 0
 
     # CSV 파일 경로 설정
     timestamp = datetime.now().strftime("%m%d-%H%M")
@@ -177,9 +180,28 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
         writer = csv.writer(f)
         writer.writerow(['epoch', 'l1_loss', 'const_loss', 'discriminator_acc', 'font_classification_acc'])
 
+        # 학습률 스케줄러 설정
+    schedulers = {
+        'generator': torch.optim.lr_scheduler.StepLR(
+            gan.g_optimizer,
+            step_size=config.schedule,
+            gamma=0.5  # 학습률을 절반으로 감소
+        ),
+        'discriminator': torch.optim.lr_scheduler.StepLR(
+            gan.d_optimizer,
+            step_size=config.schedule,
+            gamma=0.5
+        )
+    }
 
+    if callback:
+        callback.on_training_start(config)
 
     for epoch in range(start_epoch, start_epoch + config.max_epoch):
+        if callback:
+            callback.on_epoch_start(epoch+1, config.max_epoch)
+            callback.reset_batch_history()  # 새 에폭 시작시 배치 히스토리 초기화
+
         print(f"\n=== Epoch {epoch+1}/{config.max_epoch + start_epoch} ===")
         epoch_losses = {
             'g_loss': [], 
@@ -211,10 +233,20 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
                         losses['l1_loss'],
                         losses['const_loss']
                     ])
+            
+            if callback:
+                callback.on_batch_end(epoch+1, batch_idx, len(dataloader), losses)
         
         # 에포크 평균 손실 계산
         avg_losses = {k: sum(v)/len(v) for k, v in epoch_losses.items()}
 
+        # 학습률 조정
+        schedulers['generator'].step()
+        schedulers['discriminator'].step()
+
+        if callback:
+            callback.on_epoch_end(epoch+1, avg_losses, sample_dir)
+        
         def create_checkpoint(gan, epoch, avg_losses, font_embeddings):
             return {
                 'epoch': epoch,
@@ -266,6 +298,8 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
                 font_ids[:8].to(device),
                 font_embeddings
             )
+            if callback:
+                callback.on_epoch_end(epoch+1, avg_losses, sample_path=sample_dir)
         
         # 최고 성능 모델 저장
         current_loss = avg_losses['g_loss']
@@ -274,11 +308,37 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
             best_model_path = checkpoint_dir / 'best_model.pth'
             torch.save(checkpoint, best_model_path)
             print(f"Best model saved with loss: {best_loss:.4f}")
+
+        # 조기 종료 검사
+        current_loss = avg_losses['g_loss']
+        if current_loss < best_loss - min_loss_improvement:
+            best_loss = current_loss
+            patience_counter = 0
+            # 최고 성능 모델 저장
+            best_model_path = Path(save_dir) / 'checkpoints' / 'best_model.pth'
+            save_checkpoint(gan, epoch, avg_losses, best_model_path)
+            print(f"New best model saved with loss: {best_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs")
             
+            if patience_counter >= early_stopping_patience:
+                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                print(f"Best loss achieved: {best_loss:.4f}")
+                break
+        
+    # 학습이 종료됨을 알림
+    if callback:
+        callback.on_training_end()
+
     print("Training completed!")
     return gan
 
 if __name__ == "__main__":
+            # 디스코드 봇 연결
+    TOKEN = ''
+    TARGET_USER_ID = 0  # 대상 유저의 ID를 입력하세요
+
     # Configuration
     config = GANConfig(
         img_size=128,
@@ -291,9 +351,12 @@ if __name__ == "__main__":
     # Paths
     data_dir = "./dataset"
     save_dir = "./results"
-    checkpoint_path = "./results/checkpoints/checkpoint_epoch_7_1128-0024.pth"  # 이전 체크포인트 경로
+    checkpoint_path = "./results/checkpoints/checkpoint_epoch_60_1128-1815.pth"  # 이전 체크포인트 경로
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    discord_logger = DiscordLogger(TOKEN, TARGET_USER_ID)
+    callback = GANTrainingCallback(discord_logger, save_dir)
+
     # 실제 폰트 수 확인
     try:
         with open(os.path.join(data_dir, "train.pkl"), "rb") as f:
@@ -309,6 +372,7 @@ if __name__ == "__main__":
 
     # Generate embeddings if needed
     if not (Path("./fixed_dir") / "EMBEDDINGS.pkl").exists():
+        print("새로운 임베딩 생성")
         generate_font_embeddings(config.fonts_num, config.embedding_dim)
 
     # 체크포인트 경로가 있으면 학습 재개, 없으면 새로 시작
@@ -316,4 +380,4 @@ if __name__ == "__main__":
         gan = resume_training(checkpoint_path, config, data_dir, save_dir, device)
     else:
         print("\nNo checkpoint found. Starting new training...")
-        gan = train_font_gan(config, data_dir, save_dir, device)
+        gan = train_font_gan(config, data_dir, save_dir, device, callback=callback)

@@ -30,87 +30,112 @@ class DeconvBlock(nn.Module):
         return self.block(x)
 
 class Encoder(nn.Module):
-    def __init__(self, img_dim=1, conv_dim=64):
+    def __init__(self, img_dim=1, conv_dim=128):  # 기본 채널 수를 128로 증가
         super().__init__()
         
-        # Encoder layers
         self.conv1 = ConvBlock(img_dim, conv_dim, use_bn=False)      # 128x128 -> 64x64
         self.conv2 = ConvBlock(conv_dim, conv_dim * 2)               # 64x64 -> 32x32
         self.conv3 = ConvBlock(conv_dim * 2, conv_dim * 4)          # 32x32 -> 16x16
         self.conv4 = ConvBlock(conv_dim * 4, conv_dim * 8)          # 16x16 -> 8x8
         self.conv5 = ConvBlock(conv_dim * 8, conv_dim * 8)          # 8x8 -> 4x4
-        self.conv6 = ConvBlock(conv_dim * 8, conv_dim * 8)          # 4x4 -> 2x2
+        
+        # 4x4에서 3x3으로 변환하는 특별한 컨볼루션 레이어
+        self.conv6 = nn.Sequential(
+            nn.Conv2d(conv_dim * 8, conv_dim * 8, kernel_size=2, stride=1, padding=0),
+            nn.BatchNorm2d(conv_dim * 8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )  # 4x4 -> 3x3
+        
+        # 3x3 크기를 유지하면서 특징을 정제하는 레이어들
+        self.conv7 = ConvBlock(conv_dim * 8, conv_dim * 8,
+                             kernel_size=1, stride=1, padding=0)     # 3x3 유지
+        self.conv8 = ConvBlock(conv_dim * 8, conv_dim * 8,
+                             kernel_size=1, stride=1, padding=0)     # 3x3 유지     
         
     def forward(self, x):
+        # 모든 중간 특징들을 저장하기 위한 딕셔너리
         skip_connections = {}
         
-        # 각 레이어의 출력을 저장하고 shape 출력
+        # 각 레이어의 출력을 저장하여 디코더의 skip connection에서 사용
         skip_connections['e1'] = x1 = self.conv1(x)
-        # print(f"e1 shape: {x1.shape}")
-        
         skip_connections['e2'] = x2 = self.conv2(x1)
-        # print(f"e2 shape: {x2.shape}")
-        
         skip_connections['e3'] = x3 = self.conv3(x2)
-        # print(f"e3 shape: {x3.shape}")
-        
         skip_connections['e4'] = x4 = self.conv4(x3)
-        # print(f"e4 shape: {x4.shape}")
-        
         skip_connections['e5'] = x5 = self.conv5(x4)
-        # print(f"e5 shape: {x5.shape}")
-        
-        encoded = self.conv6(x5)
-        # print(f"encoded shape: {encoded.shape}")
-        skip_connections['e6'] = encoded
+        skip_connections['e6'] = x6 = self.conv6(x5)
+        skip_connections['e7'] = x7 = self.conv7(x6)
+        encoded = self.conv8(x7)
+        skip_connections['e8'] = encoded
         
         return encoded, skip_connections
 
 class Decoder(nn.Module):
-    def __init__(self, img_dim=1, embedded_dim=640, conv_dim=64):
+    def __init__(self, img_dim=1, embedded_dim=1152, conv_dim=128):  # embedded_dim을 인코더 출력(1024) + 임베딩(128)으로 수정
         super().__init__()
         
-        # Decoder layers
-        self.deconv1 = DeconvBlock(embedded_dim, conv_dim * 8, dropout=0.5)      # 2x2 -> 4x4
-        self.deconv2 = DeconvBlock(conv_dim * 16, conv_dim * 8, dropout=0.5)     # 4x4 -> 8x8
-        self.deconv3 = DeconvBlock(conv_dim * 16, conv_dim * 4)                  # 8x8 -> 16x16
-        self.deconv4 = DeconvBlock(conv_dim * 8, conv_dim * 2)                   # 16x16 -> 32x32
-        self.deconv5 = DeconvBlock(conv_dim * 4, conv_dim)                       # 32x32 -> 64x64
-        self.deconv6 = nn.Sequential(
-            nn.ConvTranspose2d(conv_dim * 2, img_dim, 4, 2, 1),                  # 64x64 -> 128x128
-            nn.Tanh()
+        # 3x3 크기의 입력을 처리하는 첫 번째 레이어
+        self.deconv1 = DeconvBlock(
+            embedded_dim,
+            conv_dim * 8,
+            kernel_size=1,
+            stride=1, 
+            padding=0,
+            dropout=0.5
+        )  # 3x3 유지
+        
+        # 3x3 크기를 유지하는 두 번째 레이어
+        self.deconv2 = DeconvBlock(
+            conv_dim * 16,
+            conv_dim * 8,
+            kernel_size=1,     # 3x3 크기 유지
+            stride=1,
+            padding=0,
+            dropout=0.5
+        )  # 3x3 유지
+        
+        # 3x3에서 4x4로 변환하는 특별한 레이어
+        self.deconv3 = DeconvBlock(
+            conv_dim * 16,
+            conv_dim * 8,
+            kernel_size=2,     # 3x3 -> 4x4
+            stride=1,
+            padding=0,
+            dropout=0.5
         )
         
-    def forward(self, x, skip_connections):
-        # 각 레이어의 입출력 shape 출력
-        # print(f"\nDecoder input shape: {x.shape}")
+        # 이후의 일반적인 디컨볼루션 레이어들
+        self.deconv4 = DeconvBlock(conv_dim * 16, conv_dim * 8)    # 4x4 -> 8x8
+        self.deconv5 = DeconvBlock(conv_dim * 16, conv_dim * 4)    # 8x8 -> 16x16
+        self.deconv6 = DeconvBlock(conv_dim * 8, conv_dim * 2)     # 16x16 -> 32x32
+        self.deconv7 = DeconvBlock(conv_dim * 4, conv_dim)         # 32x32 -> 64x64
         
+        self.deconv8 = nn.Sequential(
+            nn.ConvTranspose2d(conv_dim * 2, img_dim, 4, 2, 1),
+            nn.Tanh()
+        )  # 64x64 -> 128x128
+
+        
+    def forward(self, x, skip_connections):
+        # 각 단계별로 특징 맵의 크기를 출력하여 디버깅을 돕습니다
         x = self.deconv1(x)
-        # print(f"After deconv1: {x.shape}")
-        x = torch.cat([x, skip_connections['e5']], dim=1)
-        # print(f"After skip connection 1: {x.shape}")
+        x = torch.cat([x, skip_connections['e7']], dim=1)
         
         x = self.deconv2(x)
-        # print(f"After deconv2: {x.shape}")
-        x = torch.cat([x, skip_connections['e4']], dim=1)
-        # print(f"After skip connection 2: {x.shape}")
+        x = torch.cat([x, skip_connections['e6']], dim=1)
         
         x = self.deconv3(x)
-        # print(f"After deconv3: {x.shape}")
-        x = torch.cat([x, skip_connections['e3']], dim=1)
-        # print(f"After skip connection 3: {x.shape}")
+        x = torch.cat([x, skip_connections['e5']], dim=1)
         
         x = self.deconv4(x)
-        # print(f"After deconv4: {x.shape}")
-        x = torch.cat([x, skip_connections['e2']], dim=1)
-        # print(f"After skip connection 4: {x.shape}")
+        x = torch.cat([x, skip_connections['e4']], dim=1)
         
         x = self.deconv5(x)
-        # print(f"After deconv5: {x.shape}")
-        x = torch.cat([x, skip_connections['e1']], dim=1)
-        # print(f"After skip connection 5: {x.shape}")
+        x = torch.cat([x, skip_connections['e3']], dim=1)
         
         x = self.deconv6(x)
-        # print(f"Final output shape: {x.shape}")
+        x = torch.cat([x, skip_connections['e2']], dim=1)
         
-        return x
+        x = self.deconv7(x)
+        x = torch.cat([x, skip_connections['e1']], dim=1)
+        
+        return self.deconv8(x)
