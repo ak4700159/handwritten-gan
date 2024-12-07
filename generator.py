@@ -25,12 +25,12 @@ class FontGAN:
         # Initialize optimizers
         self.g_optimizer = torch.optim.Adam(
             list(self.encoder.parameters()) + list(self.decoder.parameters()),
-            lr=config.lr,
+            lr=config.lr * 0.2,
             betas=(config.beta1, config.beta2)
         )
         self.d_optimizer = torch.optim.Adam(
             self.discriminator.parameters(),
-            lr=config.lr,
+            lr=config.lr * 0.5,
             betas=(config.beta1, config.beta2)
         )
         
@@ -106,7 +106,11 @@ class FontGAN:
         real_target = real_target.to(self.device)
         font_embeddings = font_embeddings.to(self.device)
         font_ids = font_ids.to(self.device)  # font_ids도 GPU로 이동
-        
+
+
+        # 인코더는 고정된 상태로 특징 추출
+        with torch.no_grad():
+            encoded_source, skip_connections = self.encoder(real_source)
         # print(f"Device check - Source: {real_source.device}, Target: {real_target.device}")
         # print(f"Device check - Embeddings: {font_embeddings.device}, Font IDs: {font_ids.device}")
         
@@ -191,8 +195,10 @@ class FontGAN:
             'd_loss': d_loss.item(),
             'g_loss': g_total_loss.item(),
             'l1_loss': g_l1_loss.item(),
-            'const_loss': g_const_loss.item()
+            'const_loss': g_const_loss.item(),
+            'cat_loss' : g_cat_loss.item(),
         }
+    
     
     def _get_embeddings(self, embeddings: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
         """Get font embeddings for given IDs"""
@@ -246,6 +252,45 @@ class FontGAN:
         # Encode the generated image
         encoded_fake, _ = self.encoder(fake_target)
         return self.mse_loss(encoded_source, encoded_fake) * self.config.const_lambda
+
+    def verify_frozen_encoder(self):
+        """인코더가 제대로 고정되었는지 확인하는 함수"""
+        frozen = all(not p.requires_grad for p in self.encoder.parameters())
+        trainable = any(p.requires_grad for p in self.decoder.parameters())
+        
+        print("=== Transfer Learning Setup Verification ===")
+        print(f"Encoder frozen: {frozen}")
+        print(f"Decoder trainable: {trainable}")
+        print(f"Number of trainable parameters in decoder: {sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)}")
+        print("=========================================")
+
+    def setup_transfer_learning(self, pretrained_path: str):
+        """전이학습을 위한 모델 설정"""
+        # 사전 학습된 모델 로드
+        checkpoint = torch.load(pretrained_path, map_location=self.device)
+        
+        # 모델 가중치 로드
+        self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        
+        # 인코더 파라미터 고정
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.encoder.eval()
+        
+        # 옵티마이저 재설정 (디코더와 판별자만 학습)
+        self.g_optimizer = torch.optim.Adam(
+            self.decoder.parameters(),
+            lr=self.config.lr * 0.1,  # 더 작은 학습률 사용
+            betas=(self.config.beta1, self.config.beta2)
+        )
+        self.d_optimizer = torch.optim.Adam(
+            self.discriminator.parameters(),
+            lr=self.config.lr * 0.1,
+            betas=(self.config.beta1, self.config.beta2)
+        )
+        self.verify_frozen_encoder()
 
     def evaluate_metrics(self, dataloader, font_embeddings):
         """모델 성능 평가"""
@@ -347,16 +392,15 @@ class FontGAN:
                 target = target.to(self.device)
                 font_id = torch.tensor([font_id], device=self.device)
                 
-                encoded_source, skip_connections = self.encoder(source)
-                embedding = self._get_embeddings(font_embeddings, font_id)
-                embedded = torch.cat([encoded_source, embedding], dim=1)
-                fake_target = self.decoder(embedded, skip_connections)
+                # encoded_source, skip_connections = self.encoder(source)
+                # embedding = self._get_embeddings(font_embeddings, font_id)
+                # embedded = torch.cat([encoded_source, embedding], dim=1)
+                # fake_target = self.decoder(embedded, skip_connections)
                 
                 self.save_samples(
                     save_dir / f'eval_sample_font_{font_id.item()}.png',
                     source,
                     target,
-                    fake_target,
                     font_id,
                     font_embeddings
                 )

@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from generator import FontGAN
 from gan_config import GANConfig
-import pandas as pd
 import csv
 from datetime import datetime  # datetime.datetime 대신 datetime만 import
-from message import GANTrainingCallback, DiscordLogger
+from message import GANTrainingCallback, DiscordLogger, setup_training_callback
+from torchvision.utils import save_image
+import numpy as np
+import os
+from PIL import Image
 
 def resume_training(checkpoint_path: str, config: GANConfig, data_dir: str, save_dir: str, device: torch.device):
     """이전 체크포인트에서 학습 재개"""
@@ -65,8 +68,6 @@ def resume_training(checkpoint_path: str, config: GANConfig, data_dir: str, save
         print("Starting new training session...")
         return train_font_gan(config, data_dir, save_dir, device)
     
-
-
 def load_checkpoint(checkpoint_path: str, device: torch.device) -> dict:
     """체크포인트를 안전하게 로드"""
     try:
@@ -158,8 +159,8 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
     gan = initial_model if initial_model is not None else FontGAN(config, device)
     
     # 조기 종료를 위한 파라미터 설정
-    early_stopping_patience = 15  # 15 에폭 동안 개선이 없으면 종료
-    min_loss_improvement = 0.001  # 최소 손실 개선 기준값
+    early_stopping_patience = 50  # 15 에폭 동안 개선이 없으면 종료
+    min_loss_improvement = 0.0001  # 최소 손실 개선 기준값
     best_loss = float('inf')
     patience_counter = 0
 
@@ -174,7 +175,7 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
     # CSV 헤더 작성
     with open(loss_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'batch', 'd_loss', 'g_loss', 'l1_loss', 'const_loss'])
+        writer.writerow(['epoch', 'batch', 'd_loss', 'g_loss', 'l1_loss', 'const_loss', 'cat_loss'])
         
     with open(eval_file, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -198,26 +199,30 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
         callback.on_training_start(config)
 
     for epoch in range(start_epoch, start_epoch + config.max_epoch):
-        if callback:
-            callback.on_epoch_start(epoch+1, config.max_epoch)
-            callback.reset_batch_history()  # 새 에폭 시작시 배치 히스토리 초기화
+        # if callback:
+        #     callback.on_epoch_start(epoch+1, config.max_epoch)
+        #     callback.reset_batch_history()  # 새 에폭 시작시 배치 히스토리 초기화
 
         print(f"\n=== Epoch {epoch+1}/{config.max_epoch + start_epoch} ===")
         epoch_losses = {
             'g_loss': [], 
             'd_loss': [], 
             'l1_loss': [],
-            'const_loss': []
+            'const_loss': [],
+            'cat_loss' : []
         }
         
         for batch_idx, (source, target, font_ids) in enumerate(dataloader):
+            if callback:
+                callback.on_batch_start(epoch+1, batch_idx, len(dataloader))
+                
             losses = gan.train_step(source, target, font_embeddings, font_ids)
                 
             for k, v in losses.items():
                 epoch_losses[k].append(v)
             
             if batch_idx % config.log_step == 0:
-                log_str = f"Epoch [{epoch+1}/{config.max_epoch}], "
+                log_str = f"Epoch [{epoch+1}/{config.max_epoch + start_epoch}], "
                 log_str += f"Batch [{batch_idx+1}/{len(dataloader)}], "
                 log_str += ", ".join(f"{k}: {v:.4f}" for k, v in losses.items())
                 print(log_str)
@@ -231,7 +236,8 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
                         losses['d_loss'],
                         losses['g_loss'],
                         losses['l1_loss'],
-                        losses['const_loss']
+                        losses['const_loss'],
+                        losses['cat_loss']
                     ])
             
             if callback:
@@ -244,8 +250,8 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
         schedulers['generator'].step()
         schedulers['discriminator'].step()
 
-        if callback:
-            callback.on_epoch_end(epoch+1, avg_losses, sample_dir)
+        # if callback:
+        #     callback.on_epoch_end(epoch+1, avg_losses, sample_dir)
         
         def create_checkpoint(gan, epoch, avg_losses, font_embeddings):
             return {
@@ -298,8 +304,8 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
                 font_ids[:8].to(device),
                 font_embeddings
             )
-            if callback:
-                callback.on_epoch_end(epoch+1, avg_losses, sample_path=sample_dir)
+            # if callback:
+            #     callback.on_epoch_end(epoch+1, avg_losses, sample_path=sample_dir)
         
         # 최고 성능 모델 저장
         current_loss = avg_losses['g_loss']
@@ -328,18 +334,14 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
                 break
         
     # 학습이 종료됨을 알림
-    if callback:
-        callback.on_training_end()
+    # if callback:
+    #     callback.on_training_end()
 
     print("Training completed!")
     return gan
 
-if __name__ == "__main__":
-            # 디스코드 봇 연결
-    TOKEN = ''
-    TARGET_USER_ID = 0  # 대상 유저의 ID를 입력하세요
-
-    # Configuration
+def main():
+        # Configuration
     config = GANConfig(
         img_size=128,
         embedding_dim=128,
@@ -351,11 +353,14 @@ if __name__ == "__main__":
     # Paths
     data_dir = "./dataset"
     save_dir = "./results"
-    checkpoint_path = "./results/checkpoints/checkpoint_epoch_60_1128-1815.pth"  # 이전 체크포인트 경로
+    checkpoint_path = "./results/checkpoints/checkpoint_epoch_100_1205-2115.pth"  # 이전 체크포인트 경로
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    discord_logger = DiscordLogger(TOKEN, TARGET_USER_ID)
-    callback = GANTrainingCallback(discord_logger, save_dir)
+
+
+    # 디스코드 연결
+    # TOKEN = 'MTMxMjMxOTU2MTIxNDcyMjA0OA.G6LgmC.D5_I__tqHrE12hYDU30zPMH3vC4utsU9gjYjOs'
+    # TARGET_USER_ID = 269103512711856131  # 대상 유저의 ID를 입력하세요
+    # callback = await setup_training_callback(TOKEN, TARGET_USER_ID, "./results/samples")
 
     # 실제 폰트 수 확인
     try:
@@ -380,4 +385,170 @@ if __name__ == "__main__":
         gan = resume_training(checkpoint_path, config, data_dir, save_dir, device)
     else:
         print("\nNo checkpoint found. Starting new training...")
-        gan = train_font_gan(config, data_dir, save_dir, device, callback=callback)
+        gan = train_font_gan(config, data_dir, save_dir, device)
+
+
+# if __name__ == "__main__":
+#     main()
+# ==========================================================================================================================
+# ==========================================================================================================================
+# ==========================================================================================================================
+
+
+def train_handwriting_transfer(config: GANConfig, data_dir: str, save_dir: str, 
+                             device: torch.device, pretrained_path: str, target_font_id: int = 10):
+    """손글씨 폰트 전이학습 실행 함수 - 특정 폰트 샘플링 기능 추가"""
+    print("\n=== Starting Handwriting Transfer Learning ===")
+    print(f"Device: {device}")
+    print(f"Data directory: {data_dir}")
+    print(f"Save directory: {save_dir}")
+    print(f"Target Font ID: {target_font_id}")
+    
+    # 저장 디렉토리 생성
+    save_dir = Path(save_dir)
+    checkpoint_dir = save_dir / 'checkpoints'
+    sample_dir = save_dir / 'samples'
+    comparison_dir = save_dir / 'font_comparisons'  # 폰트 비교용 디렉토리
+    
+    for dir_path in [checkpoint_dir, sample_dir, comparison_dir]:
+        dir_path.mkdir(parents=True, exist_ok=True)
+
+    # 폰트 임베딩 로드
+    embedding_path = Path("./fixed_dir/EMBEDDINGS.pkl")
+    font_embeddings = load_embeddings(embedding_path, device)
+    
+    # GAN 모델 초기화 및 전이학습 설정
+    gan = FontGAN(config, device)
+    gan.setup_transfer_learning(pretrained_path)
+    
+    # 데이터 준비
+    image_paths = sorted(list(Path(data_dir).glob("*.png")))
+    
+    # 타겟 폰트의 참조 이미지 선택 (처음 몇 개)
+    reference_images = []
+    for path in image_paths[:4]:  # 처음 4개 이미지 사용
+        img = Image.open(path)
+        img_array = np.array(img)
+        w = img_array.shape[1]
+        source = torch.from_numpy(img_array[:, :w//2]).unsqueeze(0).float() / 127.5 - 1
+        reference_images.append(source)
+    
+    reference_batch = torch.stack(reference_images).to(device)
+    reference_ids = torch.tensor([target_font_id] * len(reference_images)).to(device)
+    
+    # 학습 루프
+    for epoch in range(config.max_epoch):
+        print(f"\n=== Epoch {epoch+1}/{config.max_epoch} ===")
+        epoch_losses = {'g_loss': [], 'd_loss': [], 'l1_loss': [], 'cat_loss': [], 'const_loss' : []}
+        
+        # 배치 학습
+        for i in range(0, len(image_paths), config.batch_size):
+            batch_paths = image_paths[i:i + config.batch_size]
+            source_images, target_images, font_ids = prepare_batch(batch_paths, device)
+            
+            # 배치 학습 수행
+            losses = gan.train_step(source_images, target_images, font_embeddings, font_ids)
+            
+            for k, v in losses.items():
+                epoch_losses[k].append(v)
+        
+        # 에포크 종료 시 평균 손실 계산
+        avg_losses = {k: sum(v)/len(v) for k, v in epoch_losses.items()}
+        
+        # 매 N 에포크마다 타겟 폰트 샘플 생성
+        if (epoch + 1) % 5 == 0:  # 5 에포크마다
+            timestamp = datetime.now().strftime("%m%d-%H%M")
+            
+            # 일반적인 학습 샘플 저장
+            # save_samples 호출 시
+            gan.save_samples(
+                sample_dir / f'samples_epoch_{epoch+1}_{timestamp}.png',
+                source_images[:4].to(device),  # 명시적으로 GPU로 이동
+                target_images[:4].to(device),  # 명시적으로 GPU로 이동
+                font_ids[:4].to(device),      # 명시적으로 GPU로 이동
+                font_embeddings
+            )
+        
+        # 로그 출력
+        print(f"Epoch {epoch+1} - " + ", ".join(f"{k}: {v:.4f}" for k, v in avg_losses.items()))
+        print(f"Samples saved to {comparison_dir}")
+    
+    return gan
+
+def load_checkpoint(checkpoint_path: str, device: torch.device) -> dict:
+    """체크포인트를 로드하고 손실값을 보여주는 함수"""
+    try:
+        print("\n=== Loading Checkpoint and Checking Losses ===")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # 손실값 출력
+        if 'losses' in checkpoint:
+            losses = checkpoint['losses']
+            print("\nLoss Values from Checkpoint:")
+            for loss_type, value in losses.items():
+                print(f"{loss_type}: {value:.4f}")
+        else:
+            print("\nNo loss values found in checkpoint")
+        
+        # 안전한 체크포인트 반환
+        safe_checkpoint = {
+            'encoder_state_dict': checkpoint['encoder_state_dict'],
+            'decoder_state_dict': checkpoint['decoder_state_dict'],
+            'discriminator_state_dict': checkpoint['discriminator_state_dict'],
+            'g_optimizer_state_dict': checkpoint['g_optimizer_state_dict'],
+            'd_optimizer_state_dict': checkpoint['d_optimizer_state_dict'],
+            'epoch': checkpoint['epoch'],
+            'losses': checkpoint.get('losses', {})
+        }
+        
+        return safe_checkpoint
+        
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        raise
+
+
+# prepare_batch 함수 수정
+def prepare_batch(batch_paths, device):  # device 매개변수 추가
+    source_images = []
+    target_images = []
+    font_ids = []
+    
+    for path in batch_paths:
+        img = Image.open(path)
+        img_array = np.array(img)
+        w = img_array.shape[1]
+        
+        source = torch.from_numpy(img_array[:, :w//2]).unsqueeze(0).float() / 127.5 - 1
+        target = torch.from_numpy(img_array[:, w//2:]).unsqueeze(0).float() / 127.5 - 1
+        
+        source_images.append(source)
+        target_images.append(target)
+        font_ids.append(int(path.stem.split('_')[0]))
+    
+    # GPU로 이동
+    return (torch.stack(source_images).to(device), 
+            torch.stack(target_images).to(device),
+            torch.tensor(font_ids).to(device))
+
+# 메인 실행 코드
+def main():
+    config = GANConfig(
+        img_size=128,
+        embedding_dim=128,
+        batch_size=16,  # 더 작은 배치 사이즈
+        max_epoch=50,   # 더 적은 에포크
+        fonts_num=26,   # 기존 폰트 수 유지
+        lr=0.0001       # 더 작은 학습률
+    )
+    
+    data_dir = "./get_data/handwritten_result"  # 손글씨 데이터 디렉토리
+    save_dir = "./final_data"
+    pretrained_path = "./results/checkpoints/best_model.pth"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    load_checkpoint(pretrained_path, device)
+    gan = train_handwriting_transfer(config, data_dir, save_dir, device, pretrained_path)
+    return gan
+
+if __name__ == "__main__":
+    main()

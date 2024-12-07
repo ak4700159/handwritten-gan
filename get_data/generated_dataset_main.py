@@ -1,10 +1,10 @@
 from time import sleep
-import font2img as ft
 from PIL import ImageFont
 import os
 import random
-import package
 import gc
+import glob
+import pickle as pickle
 from functools import cache, lru_cache
 import threading
 
@@ -13,6 +13,71 @@ import threading
 FONT_DATASET_PATH = "./font_dataset"
 MAX_FONT_COUNT = 25
 MAX_RAMDOM_SELECTED_WORD = 2000
+
+# from_dir = './font_dataset
+# train_path = "../dataset/train"
+# val_path = "../dataset/val"
+# train_val_split = 트레인 데이터와 평가 데이터의 비율을 의미
+# with_charid = 제목에 char_id가 표시되어 있는지
+def pickle_examples(from_dir, train_path, val_path, train_val_split=0.0, with_charid=False):
+    """
+    Compile a list of examples into pickled format, so during
+    the training, all io will happen in memory
+    """
+    paths = glob.glob(os.path.join(from_dir, "*.png"))
+    with open(train_path, 'wb') as ft:
+        with open(val_path, 'wb') as fv:
+            print('all data num:', len(paths))
+            c = 1
+            val_count = 0
+            train_count = 0
+            if with_charid:
+                print('pickle with charid')
+                # paths 경로 안에는 font_dataset 안의 파일 이름 모두 담기게 된다
+                for p in paths:
+                    c += 1
+                    label = int(os.path.basename(p).split("_")[0])
+                    charid = int(os.path.basename(p).split("_")[1].split(".")[0])
+                    # .png 파일 하나를 열고 이미지를 읽고 
+                    # label(어떤 폰트 사용했는지), charid(문자 식별 번호), img_bytes(이미지 데이터)
+                    with open(p, 'rb') as f:
+                        img_bytes = f.read()
+                        example = (label, charid, img_bytes)
+                        r = random.random()
+                        # 설정한 비율데로 train val 파일에 저장된다.
+                        if r < train_val_split:
+                            pickle.dump(example, fv)
+                            val_count += 1
+                            if val_count % 10000 == 0:
+                                print("%d imgs saved in val.obj" % val_count)
+                        else:
+                            pickle.dump(example, ft)
+                            train_count += 1
+                            if train_count % 10000 == 0:
+                                print("%d imgs saved in train.obj" % train_count)
+                print("%d imgs saved in val.obj, end" % val_count)
+                print("%d imgs saved in train.obj, end" % train_count)
+            else:
+                for p in paths:
+                    c += 1
+                    label = int(os.path.basename(p).split("_")[0])
+                    with open(p, 'rb') as f:
+                        img_bytes = f.read()
+                        example = (label, img_bytes)
+                        r = random.random()
+                        if r < train_val_split:
+                            pickle.dump(example, fv)
+                            val_count += 1
+                            if val_count % 10000 == 0:
+                                print("%d imgs saved in val.obj" % val_count)
+                        else:
+                            pickle.dump(example, ft)
+                            train_count += 1
+                            if train_count % 10000 == 0:
+                                print("%d imgs saved in train.obj" % train_count)
+                print("%d imgs saved in val.obj, end" % val_count)
+                print("%d imgs saved in train.obj, end" % train_count)
+            return
 
 # count 수 만큼 글자를 생성
 def generate_random_hangul_and_ascii():
@@ -34,7 +99,6 @@ def generate_random_hangul_and_ascii():
 
 
 # 폰트별 MAX_RAMDOM_SELECTED_WORD 만큼 이미지를 생성한다
-src_path = f"{ft.SRC_PATH}/source_font.ttf"
 def generated_dataset(font_id):
     if not os.path.exists(FONT_DATASET_PATH):
         os.mkdir(FONT_DATASET_PATH)
@@ -78,7 +142,7 @@ def main():
         threads[font_idx].join()   
         
 if __name__ == "__main__":
-    main()
+    # main()
     # 생성한 학습용 데이터를 train / value 데이터로 나눈다 (4:1) --> .pkl 파일에 저장
-    package.pickle_examples('./font_dataset', '../dataset/train.pkl', '../dataset/val.pkl', with_charid=True)
+    pickle_examples('./handwritten_result', '../dataset/handwritten_train.pkl', '../dataset/handwritten_val.pkl', with_charid=True)
 

@@ -8,8 +8,8 @@ class GANConfig:
     img_size: int = 128
     embedding_dim: int = 128
     conv_dim: int = 128
-    batch_size: int = 32
-    lr: float = 0.0002
+    batch_size: int = 64
+    lr: float = 0.0001
     beta1: float = 0.5
     beta2: float = 0.999
     max_epoch: int = 100
@@ -17,7 +17,7 @@ class GANConfig:
     l1_lambda: float = 80
     const_lambda: float = 10
     sample_step: int = 350
-    model_save_step: int = 5
+    model_save_step: int = 1
     fonts_num: int = 26  # 폰트 개수 추가
     log_step: int = 20  # 로깅 주기(몇 번째 배치마다)
     eval_step: int = 5 # 5 에포크마다 평가
