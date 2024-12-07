@@ -111,20 +111,23 @@ def save_checkpoint(model: FontGAN, epoch: int, losses: dict, save_path: Path):
         print(f"Failed to save checkpoint: {e}")
 
 def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torch.device, 
-                  start_epoch: int = 0, initial_model: Optional[FontGAN] = None, callback: GANTrainingCallback = None):
-    print("\n=== Starting Font GAN Training ===")
+                  start_epoch: int = 0, initial_model: Optional[FontGAN] = None, 
+                  callback: GANTrainingCallback = None,
+                  pretrained_path: str = None):  # 사전 학습된 모델 경로 추가
+    """폰트 GAN 학습 함수 - 전이학습 지원 추가"""
+    print("\n=== Starting Font GAN Transfer Learning ===")
     print(f"Device: {device}")
     print(f"Data directory: {data_dir}")
     print(f"Save directory: {save_dir}")
     print(f"Starting from epoch: {start_epoch}")
     
-    # 저장 디렉토리 생성
+    # 저장 디렉토리 설정
     save_dir = Path(save_dir)
     checkpoint_dir = save_dir / 'checkpoints'
     sample_dir = save_dir / 'samples'
     
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    sample_dir.mkdir(parents=True, exist_ok=True)
+    for dir_path in [checkpoint_dir, sample_dir]:
+        dir_path.mkdir(parents=True, exist_ok=True)
 
     # 폰트 임베딩 로드
     embedding_path = Path("./fixed_dir/EMBEDDINGS.pkl")
@@ -133,7 +136,34 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
     
     font_embeddings = load_embeddings(embedding_path, device)
     
-    # 학습용 데이터 로더 설정
+    # GAN 모델 초기화 또는 로드
+    if initial_model is None:
+        gan = FontGAN(config, device)
+        if pretrained_path:  # 사전 학습된 모델이 제공된 경우
+            print(f"Loading pretrained model from {pretrained_path}")
+            checkpoint = torch.load(pretrained_path, map_location=device)
+            
+            # 모델 가중치 로드
+            gan.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            gan.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+            
+            # 인코더 고정 (전이학습을 위해)
+            for param in gan.encoder.parameters():
+                param.requires_grad = False
+            gan.encoder.eval()
+            
+            print("Encoder frozen for transfer learning")
+            
+            # 옵티마이저 재설정 (디코더만을 위한)
+            gan.g_optimizer = torch.optim.Adam(
+                gan.decoder.parameters(),
+                lr=config.lr,
+                betas=(config.beta1, config.beta2)
+            )
+    else:
+        gan = initial_model
+    
+    # 데이터 로더 설정
     dataset = FontDataset(data_dir, config.img_size)
     dataloader = DataLoader(
         dataset,
@@ -142,408 +172,121 @@ def train_font_gan(config: GANConfig, data_dir: str, save_dir: str, device: torc
         num_workers=4,
         pin_memory=True
     )
-
-    # 평가용 데이터로더 설정
-    val_dataset = FontDataset(data_dir, config.img_size)
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    print(f"Validation dataset size: {len(val_dataset)}")
-    print(f"Number of validation batches: {len(val_loader)}")
     
-    # GAN 모델 초기화 또는 기존 모델 사용
-    gan = initial_model if initial_model is not None else FontGAN(config, device)
-    
-    # 조기 종료를 위한 파라미터 설정
-    early_stopping_patience = 50  # 15 에폭 동안 개선이 없으면 종료
-    min_loss_improvement = 0.0001  # 최소 손실 개선 기준값
+    # 학습 상태 추적을 위한 변수들
     best_loss = float('inf')
     patience_counter = 0
-
-    # CSV 파일 경로 설정
-    timestamp = datetime.now().strftime("%m%d-%H%M")
-    metrics_dir = Path(save_dir) / 'metrics'
-    metrics_dir.mkdir(parents=True, exist_ok=True)
     
-    loss_file = metrics_dir / f'training_losses_{timestamp}.csv'
-    eval_file = metrics_dir / f'evaluation_metrics_{timestamp}.csv'
-    
-    # CSV 헤더 작성
-    with open(loss_file, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['epoch', 'batch', 'd_loss', 'g_loss', 'l1_loss', 'const_loss', 'cat_loss'])
-        
-    with open(eval_file, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['epoch', 'l1_loss', 'const_loss', 'discriminator_acc', 'font_classification_acc'])
-
-        # 학습률 스케줄러 설정
-    schedulers = {
-        'generator': torch.optim.lr_scheduler.StepLR(
-            gan.g_optimizer,
-            step_size=config.schedule,
-            gamma=0.5  # 학습률을 절반으로 감소
-        ),
-        'discriminator': torch.optim.lr_scheduler.StepLR(
-            gan.d_optimizer,
-            step_size=config.schedule,
-            gamma=0.5
-        )
-    }
-
-    if callback:
-        callback.on_training_start(config)
-
+    # 학습 루프
     for epoch in range(start_epoch, start_epoch + config.max_epoch):
-        # if callback:
-        #     callback.on_epoch_start(epoch+1, config.max_epoch)
-        #     callback.reset_batch_history()  # 새 에폭 시작시 배치 히스토리 초기화
-
         print(f"\n=== Epoch {epoch+1}/{config.max_epoch + start_epoch} ===")
         epoch_losses = {
-            'g_loss': [], 
-            'd_loss': [], 
-            'l1_loss': [],
-            'const_loss': [],
-            'cat_loss' : []
+            'g_loss': [], 'd_loss': [], 
+            'l1_loss': [], 'const_loss': [],
+            'cat_loss': []
         }
         
+        # 배치 학습
         for batch_idx, (source, target, font_ids) in enumerate(dataloader):
-            if callback:
-                callback.on_batch_start(epoch+1, batch_idx, len(dataloader))
-                
+            # 학습 단계
             losses = gan.train_step(source, target, font_embeddings, font_ids)
-                
+            
+            # 손실값 기록
             for k, v in losses.items():
                 epoch_losses[k].append(v)
             
+            # 진행상황 출력
             if batch_idx % config.log_step == 0:
                 log_str = f"Epoch [{epoch+1}/{config.max_epoch + start_epoch}], "
                 log_str += f"Batch [{batch_idx+1}/{len(dataloader)}], "
                 log_str += ", ".join(f"{k}: {v:.4f}" for k, v in losses.items())
                 print(log_str)
-                
-                # CSV에 손실값 기록
-                with open(loss_file, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        epoch + 1,
-                        batch_idx + 1,
-                        losses['d_loss'],
-                        losses['g_loss'],
-                        losses['l1_loss'],
-                        losses['const_loss'],
-                        losses['cat_loss']
-                    ])
-            
-            if callback:
-                callback.on_batch_end(epoch+1, batch_idx, len(dataloader), losses)
         
         # 에포크 평균 손실 계산
         avg_losses = {k: sum(v)/len(v) for k, v in epoch_losses.items()}
-
-        # 학습률 조정
-        schedulers['generator'].step()
-        schedulers['discriminator'].step()
-
-        # if callback:
-        #     callback.on_epoch_end(epoch+1, avg_losses, sample_dir)
         
-        def create_checkpoint(gan, epoch, avg_losses, font_embeddings):
-            return {
-                'epoch': epoch,
-                'encoder_state_dict': gan.encoder.state_dict(),
-                'decoder_state_dict': gan.decoder.state_dict(),
-                'discriminator_state_dict': gan.discriminator.state_dict(),
-                'g_optimizer_state_dict': gan.g_optimizer.state_dict(),
-                'd_optimizer_state_dict': gan.d_optimizer.state_dict(),
-                'config': config,
-                'losses': avg_losses,
-                'font_embeddings': font_embeddings
-            }        
-        
-        # 현재 체크포인트 생성
-        checkpoint = create_checkpoint(gan, epoch, avg_losses, font_embeddings)
-
-        # 주기적으로 평가 수행
-        if (epoch + 1) % config.eval_step == 0:
-            print(f"\nEvaluating model at epoch {epoch + 1}...")
-            metrics = gan.evaluate_metrics(val_loader, font_embeddings)
-            
-            # 평가 샘플 생성
-            eval_dir = Path(save_dir) / 'evaluation' / f'epoch_{epoch+1}'
-            gan.generate_evaluation_samples(val_loader, font_embeddings, eval_dir)
-
-            # CSV에 평가 지표 기록
-            with open(eval_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    epoch + 1,
-                    metrics['l1_loss'],
-                    metrics['const_loss'],
-                    metrics['discriminator_acc'],
-                    metrics['font_classification_acc']
-                ])
-        
-
-        # 일정 주기로 체크포인트 저장
-        if (epoch + 1) % config.model_save_step == 0:
-            timestamp = datetime.now().strftime("%m%d-%H%M")
-            save_path = checkpoint_dir / f'checkpoint_epoch_{epoch+1}_{timestamp}.pth'
-            save_checkpoint(gan, epoch, avg_losses, save_path)
-            
-            # 샘플 이미지 생성 및 저장
+        # 샘플 이미지 생성 및 저장
+        if (epoch + 1) % 5 == 0:
             gan.save_samples(
-                sample_dir / f'samples_epoch_{epoch+1}_{timestamp}.png',
-                source[:8].to(device), 
-                target[:8].to(device), 
-                font_ids[:8].to(device),
+                sample_dir / f'transfer_samples_epoch_{epoch+1}.png',
+                source[:4].to(device), 
+                target[:4].to(device), 
+                font_ids[:4].to(device),
                 font_embeddings
             )
-            # if callback:
-            #     callback.on_epoch_end(epoch+1, avg_losses, sample_path=sample_dir)
         
-        # 최고 성능 모델 저장
-        current_loss = avg_losses['g_loss']
-        if current_loss < best_loss:
-            best_loss = current_loss
-            best_model_path = checkpoint_dir / 'best_model.pth'
-            torch.save(checkpoint, best_model_path)
-            print(f"Best model saved with loss: {best_loss:.4f}")
-
-        # 조기 종료 검사
-        current_loss = avg_losses['g_loss']
-        if current_loss < best_loss - min_loss_improvement:
-            best_loss = current_loss
+        # 체크포인트 저장
+        if avg_losses['g_loss'] < best_loss:
+            best_loss = avg_losses['g_loss']
+            save_checkpoint(gan, epoch, avg_losses, 
+                          checkpoint_dir / 'best_transfer_model.pth')
             patience_counter = 0
-            # 최고 성능 모델 저장
-            best_model_path = Path(save_dir) / 'checkpoints' / 'best_model.pth'
-            save_checkpoint(gan, epoch, avg_losses, best_model_path)
-            print(f"New best model saved with loss: {best_loss:.4f}")
         else:
             patience_counter += 1
-            print(f"No improvement for {patience_counter} epochs")
-            
-            if patience_counter >= early_stopping_patience:
-                print(f"\nEarly stopping triggered after {epoch+1} epochs")
-                print(f"Best loss achieved: {best_loss:.4f}")
+            if patience_counter >= 15:  # 조기 종료 조건
+                print("\nEarly stopping triggered")
                 break
-        
-    # 학습이 종료됨을 알림
-    # if callback:
-    #     callback.on_training_end()
-
-    print("Training completed!")
+    
+    print("Transfer learning completed!")
     return gan
-
 def main():
-        # Configuration
+    # 기존의 설정을 최대한 활용하되, 전이학습에 맞게 일부 수정
     config = GANConfig(
         img_size=128,
         embedding_dim=128,
-        batch_size=32,
-        max_epoch=100,
-        fonts_num=26
+        batch_size=32,        # 기존 배치 크기 유지
+        max_epoch=100,        # 기존 에포크 수 유지
+        fonts_num=26,         # 기존 폰트 수 유지
+        lr=0.0001,           # 기존 학습률 유지
+        schedule=20,          # 기존 스케줄링 간격 유지
+        l1_lambda=80,        # 스타일 보존을 위한 L1 가중치
+        const_lambda=10,     # 일관성 유지를 위한 가중치
+        eval_step=5          # 평가 주기 유지
     )
     
-    # Paths
+    # 경로 설정
     data_dir = "./dataset"
-    save_dir = "./results"
-    checkpoint_path = "./results/checkpoints/checkpoint_epoch_100_1205-2115.pth"  # 이전 체크포인트 경로
+    save_dir = "./final_data"
+    checkpoint_path = "./results/checkpoints/best_model.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-    # 실제 폰트 수 확인
-    try:
-        with open(os.path.join(data_dir, "train.pkl"), "rb") as f:
-            data = pickle.load(f)
-            if isinstance(data, list) and len(data) > 0:
-                font_ids = set([item[0] for item in data])
-                actual_fonts_num = len(font_ids)
-                print(f"Detected {actual_fonts_num} unique fonts")
-                config.fonts_num = actual_fonts_num
-    except Exception as e:
-        print(f"Warning: Could not automatically detect number of fonts: {e}")
-        print("Using default value:", config.fonts_num)
-
-    # Generate embeddings if needed
-    if not (Path("./fixed_dir") / "EMBEDDINGS.pkl").exists():
-        print("새로운 임베딩 생성")
-        generate_font_embeddings(config.fonts_num, config.embedding_dim)
-
-    # 체크포인트 경로가 있으면 학습 재개, 없으면 새로 시작
-    if os.path.exists(checkpoint_path):
-        gan = resume_training(checkpoint_path, config, data_dir, save_dir, device)
-    else:
-        print("\nNo checkpoint found. Starting new training...")
-        gan = train_font_gan(config, data_dir, save_dir, device)
-
-
-# if __name__ == "__main__":
-#     main()
-# ==========================================================================================================================
-# ==========================================================================================================================
-# ==========================================================================================================================
-
-
-def train_handwriting_transfer(config: GANConfig, data_dir: str, save_dir: str, 
-                             device: torch.device, pretrained_path: str, target_font_id: int = 10):
-    """손글씨 폰트 전이학습 실행 함수 - 특정 폰트 샘플링 기능 추가"""
-    print("\n=== Starting Handwriting Transfer Learning ===")
-    print(f"Device: {device}")
-    print(f"Data directory: {data_dir}")
-    print(f"Save directory: {save_dir}")
-    print(f"Target Font ID: {target_font_id}")
+    # 먼저 체크포인트를 로드하여 손실값 확인
+    checkpoint = load_checkpoint(checkpoint_path, device)
     
-    # 저장 디렉토리 생성
-    save_dir = Path(save_dir)
-    checkpoint_dir = save_dir / 'checkpoints'
-    sample_dir = save_dir / 'samples'
-    comparison_dir = save_dir / 'font_comparisons'  # 폰트 비교용 디렉토리
-    
-    for dir_path in [checkpoint_dir, sample_dir, comparison_dir]:
-        dir_path.mkdir(parents=True, exist_ok=True)
-
-    # 폰트 임베딩 로드
-    embedding_path = Path("./fixed_dir/EMBEDDINGS.pkl")
-    font_embeddings = load_embeddings(embedding_path, device)
-    
-    # GAN 모델 초기화 및 전이학습 설정
+    # 전이학습을 위한 모델 초기화
     gan = FontGAN(config, device)
-    gan.setup_transfer_learning(pretrained_path)
     
-    # 데이터 준비
-    image_paths = sorted(list(Path(data_dir).glob("*.png")))
+    # 사전 학습된 가중치 로드
+    gan.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+    gan.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+    gan.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
     
-    # 타겟 폰트의 참조 이미지 선택 (처음 몇 개)
-    reference_images = []
-    for path in image_paths[:4]:  # 처음 4개 이미지 사용
-        img = Image.open(path)
-        img_array = np.array(img)
-        w = img_array.shape[1]
-        source = torch.from_numpy(img_array[:, :w//2]).unsqueeze(0).float() / 127.5 - 1
-        reference_images.append(source)
+    # 인코더 고정
+    for param in gan.encoder.parameters():
+        param.requires_grad = False
+    gan.encoder.eval()
     
-    reference_batch = torch.stack(reference_images).to(device)
-    reference_ids = torch.tensor([target_font_id] * len(reference_images)).to(device)
-    
-    # 학습 루프
-    for epoch in range(config.max_epoch):
-        print(f"\n=== Epoch {epoch+1}/{config.max_epoch} ===")
-        epoch_losses = {'g_loss': [], 'd_loss': [], 'l1_loss': [], 'cat_loss': [], 'const_loss' : []}
-        
-        # 배치 학습
-        for i in range(0, len(image_paths), config.batch_size):
-            batch_paths = image_paths[i:i + config.batch_size]
-            source_images, target_images, font_ids = prepare_batch(batch_paths, device)
-            
-            # 배치 학습 수행
-            losses = gan.train_step(source_images, target_images, font_embeddings, font_ids)
-            
-            for k, v in losses.items():
-                epoch_losses[k].append(v)
-        
-        # 에포크 종료 시 평균 손실 계산
-        avg_losses = {k: sum(v)/len(v) for k, v in epoch_losses.items()}
-        
-        # 매 N 에포크마다 타겟 폰트 샘플 생성
-        if (epoch + 1) % 5 == 0:  # 5 에포크마다
-            timestamp = datetime.now().strftime("%m%d-%H%M")
-            
-            # 일반적인 학습 샘플 저장
-            # save_samples 호출 시
-            gan.save_samples(
-                sample_dir / f'samples_epoch_{epoch+1}_{timestamp}.png',
-                source_images[:4].to(device),  # 명시적으로 GPU로 이동
-                target_images[:4].to(device),  # 명시적으로 GPU로 이동
-                font_ids[:4].to(device),      # 명시적으로 GPU로 이동
-                font_embeddings
-            )
-        
-        # 로그 출력
-        print(f"Epoch {epoch+1} - " + ", ".join(f"{k}: {v:.4f}" for k, v in avg_losses.items()))
-        print(f"Samples saved to {comparison_dir}")
-    
-    return gan
-
-def load_checkpoint(checkpoint_path: str, device: torch.device) -> dict:
-    """체크포인트를 로드하고 손실값을 보여주는 함수"""
-    try:
-        print("\n=== Loading Checkpoint and Checking Losses ===")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        
-        # 손실값 출력
-        if 'losses' in checkpoint:
-            losses = checkpoint['losses']
-            print("\nLoss Values from Checkpoint:")
-            for loss_type, value in losses.items():
-                print(f"{loss_type}: {value:.4f}")
-        else:
-            print("\nNo loss values found in checkpoint")
-        
-        # 안전한 체크포인트 반환
-        safe_checkpoint = {
-            'encoder_state_dict': checkpoint['encoder_state_dict'],
-            'decoder_state_dict': checkpoint['decoder_state_dict'],
-            'discriminator_state_dict': checkpoint['discriminator_state_dict'],
-            'g_optimizer_state_dict': checkpoint['g_optimizer_state_dict'],
-            'd_optimizer_state_dict': checkpoint['d_optimizer_state_dict'],
-            'epoch': checkpoint['epoch'],
-            'losses': checkpoint.get('losses', {})
-        }
-        
-        return safe_checkpoint
-        
-    except Exception as e:
-        print(f"Error loading checkpoint: {e}")
-        raise
-
-
-# prepare_batch 함수 수정
-def prepare_batch(batch_paths, device):  # device 매개변수 추가
-    source_images = []
-    target_images = []
-    font_ids = []
-    
-    for path in batch_paths:
-        img = Image.open(path)
-        img_array = np.array(img)
-        w = img_array.shape[1]
-        
-        source = torch.from_numpy(img_array[:, :w//2]).unsqueeze(0).float() / 127.5 - 1
-        target = torch.from_numpy(img_array[:, w//2:]).unsqueeze(0).float() / 127.5 - 1
-        
-        source_images.append(source)
-        target_images.append(target)
-        font_ids.append(int(path.stem.split('_')[0]))
-    
-    # GPU로 이동
-    return (torch.stack(source_images).to(device), 
-            torch.stack(target_images).to(device),
-            torch.tensor(font_ids).to(device))
-
-# 메인 실행 코드
-def main():
-    config = GANConfig(
-        img_size=128,
-        embedding_dim=128,
-        batch_size=16,  # 더 작은 배치 사이즈
-        max_epoch=50,   # 더 적은 에포크
-        fonts_num=26,   # 기존 폰트 수 유지
-        lr=0.0001       # 더 작은 학습률
+    # 디코더만을 위한 옵티마이저 재설정 (g_optimizer 재정의)
+    gan.g_optimizer = torch.optim.Adam(
+        gan.decoder.parameters(),
+        lr=config.lr,
+        betas=(config.beta1, config.beta2)
     )
     
-    data_dir = "./get_data/handwritten_result"  # 손글씨 데이터 디렉토리
-    save_dir = "./final_data"
-    pretrained_path = "./results/checkpoints/best_model.pth"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    load_checkpoint(pretrained_path, device)
-    gan = train_handwriting_transfer(config, data_dir, save_dir, device, pretrained_path)
+    # 기존의 train_font_gan 함수 호출
+    gan = train_font_gan(
+        config=config,
+        data_dir=data_dir,
+        save_dir=save_dir,
+        device=device,
+        start_epoch=0,
+        initial_model=gan  # 이미 설정된 모델 전달
+    )
+    
     return gan
 
 if __name__ == "__main__":
     main()
+# ==========================================================================================================================
+# ==========================================================================================================================
+# =========================================================================================================================

@@ -28,7 +28,7 @@ class FontDataset:
         """Load and preprocess image data"""
         processed_data = []
         try:
-            with open(self.data_dir / "train.pkl", "rb") as f:
+            with open(self.data_dir / "handwritten_train.pkl", "rb") as f:
                 while True:
                     try:
                         # 데이터를 하나씩 로드

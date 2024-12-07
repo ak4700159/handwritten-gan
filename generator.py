@@ -234,6 +234,8 @@ class FontGAN:
     
     def _category_loss(self, real_cat: torch.Tensor, fake_cat: torch.Tensor, font_ids: torch.Tensor) -> torch.Tensor:
         """Calculate category classification loss"""
+        if torch.any(font_ids < 0) or torch.any(font_ids >= self.config.fonts_num):
+            raise ValueError("font_ids contains values outside the expected range")
         # font_ids를 GPU로 이동
         font_ids = font_ids.to(self.device)
         
