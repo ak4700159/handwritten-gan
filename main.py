@@ -357,11 +357,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-    # 디스코드 연결
-    # TOKEN = 'MTMxMjMxOTU2MTIxNDcyMjA0OA.G6LgmC.D5_I__tqHrE12hYDU30zPMH3vC4utsU9gjYjOs'
-    # TARGET_USER_ID = 269103512711856131  # 대상 유저의 ID를 입력하세요
-    # callback = await setup_training_callback(TOKEN, TARGET_USER_ID, "./results/samples")
-
     # 실제 폰트 수 확인
     try:
         with open(os.path.join(data_dir, "train.pkl"), "rb") as f:
